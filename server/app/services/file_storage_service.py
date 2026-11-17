@@ -1,0 +1,135 @@
+"""
+Single entry point every upload endpoint should use to save an uploaded
+file. Tries Backblaze B2 first (see b2_service.py for why it replaced
+Drive as the preferred backend), then Google Drive (via a service
+account — no per-user login needed) if B2 isn't configured, and only
+falls back to local disk if neither is set up.
+
+Why this exists: local disk on Render (and most PaaS free/starter tiers)
+is ephemeral — anything written to it is wiped on the next deploy or
+restart. Files uploaded to B2 or Drive instead persist regardless of how
+often the app redeploys. Local disk remains the fallback so nothing
+breaks in a dev environment where no cloud storage credentials have been
+set up.
+"""
+import io
+import logging
+from typing import Optional
+
+from app.services import b2_service
+from app.services.drive_service import DriveService
+from app.exceptions import DriveAccessDenied
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def drive_storage_available() -> bool:
+    try:
+        DriveService.get_service_account_credentials()
+        return True
+    except DriveAccessDenied:
+        return False
+    except Exception:
+        return False
+
+
+async def store_uploaded_file(file_bytes: bytes, filename: str, mime_type: str, subfolder: str) -> dict:
+    """
+    Saves an uploaded file and returns {"url": ..., "storage": "b2" | "drive" | "local"}.
+
+    - "b2": `url` is this app's own /api/v1/files/b2/{key} endpoint,
+      which redirects to a freshly-generated presigned Backblaze B2 URL
+      on every visit. Persists across redeploys and, unlike Drive, has
+      no timed credential expiry — see b2_service.py's docstring for why
+      it's a private bucket + redirect instead of a plain public link.
+    - "drive": `url` is a public (anyone-with-the-link) Google Drive view
+      link. Persists across redeploys, but see b2_service.py's docstring
+      for why this can silently stop working after ~7 days if the OAuth
+      app is still in Google's "Testing" publishing status.
+    - "local": `url` is the existing `/uploads/<subfolder>/<filename>`
+      relative path served by the app's own StaticFiles mount. Does NOT
+      persist across a Render redeploy without a Persistent Disk — this
+      path only exists so local development keeps working without any
+      cloud storage set up.
+    """
+    if b2_service.b2_configured():
+        try:
+            key = f"{subfolder}/{filename}"
+            await b2_service.upload_file(file_bytes, key, mime_type or "application/octet-stream")
+            # Private bucket, so there's no plain public URL for this
+            # object — point at our own redirect endpoint instead, which
+            # mints a fresh short-lived presigned URL on every visit.
+            url = f"{settings.BASE_URL}/api/v1/files/b2/{key}"
+            return {"url": url, "storage": "b2"}
+        except Exception as e:
+            logger.warning(f"B2 upload failed, falling back to Drive/local: {e}")
+
+    try:
+        credentials = DriveService.get_service_account_credentials()
+        file_obj = io.BytesIO(file_bytes)
+        # Group uploads by type in Drive too, mirroring the local
+        # subfolder structure, so the app's Drive account doesn't end up
+        # with hundreds of unsorted files in one place.
+        folder_id = await _get_or_create_subfolder(credentials, subfolder)
+        result = await DriveService.upload_file(
+            file_obj=file_obj,
+            filename=filename,
+            mime_type=mime_type or "application/octet-stream",
+            credentials=credentials,
+            folder_id=folder_id,
+        )
+        file_id = result.get("id")
+        await DriveService.make_public(credentials, file_id)
+        url = result.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+        return {"url": url, "storage": "drive"}
+    except Exception as e:
+        logger.warning(f"Drive upload failed or not configured, falling back to local disk: {e}")
+
+    # Fallback: local disk (existing behavior, unchanged)
+    import asyncio
+    from app.utils.uploads import get_upload_subdir
+    upload_dir = get_upload_subdir(subfolder)
+    filepath = upload_dir / filename
+
+    # Plain (blocking) open()/write() here would stall the whole event
+    # loop while waiting on disk I/O — asyncio.to_thread() runs it on a
+    # worker thread instead, same fix as applied to email_service.py.
+    def _write_file_bytes(path, data: bytes) -> None:
+        with open(path, "wb") as f:
+            f.write(data)
+
+    await asyncio.to_thread(_write_file_bytes, filepath, file_bytes)
+    return {"url": f"/uploads/{subfolder}/{filename}", "storage": "local"}
+
+
+# Cache subfolder IDs for the lifetime of the process so we don't call
+# Drive's API to look up/create the same folder on every single upload.
+_subfolder_cache: dict = {}
+
+
+async def _get_or_create_subfolder(credentials, subfolder: str) -> Optional[str]:
+    if subfolder in _subfolder_cache:
+        return _subfolder_cache[subfolder]
+
+    from googleapiclient.discovery import build
+    service = build("drive", "v3", credentials=credentials)
+    parent = settings.GOOGLE_FOLDER_ID or None
+
+    query = f"name = '{subfolder}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent:
+        query += f" and '{parent}' in parents"
+
+    results = service.files().list(q=query, fields="files(id, name)", pageSize=1).execute()
+    existing = results.get("files", [])
+    if existing:
+        folder_id = existing[0]["id"]
+    else:
+        metadata = {"name": subfolder, "mimeType": "application/vnd.google-apps.folder"}
+        if parent:
+            metadata["parents"] = [parent]
+        folder = service.files().create(body=metadata, fields="id").execute()
+        folder_id = folder.get("id")
+
+    _subfolder_cache[subfolder] = folder_id
+    return folder_id

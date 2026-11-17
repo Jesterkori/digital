@@ -1,0 +1,974 @@
+import { getDelegation, clearDelegation, delegationHeaders, delegationHomePath, DELEGATION_HEADER } from '../../utils/delegation'
+
+const RAW_BASE = import.meta.env.VITE_API_URL || '/api/v1'
+const API_BASE_URL = (() => {
+  let u = (RAW_BASE || '').trim()
+  if (!u) return '/api/v1'
+  if (u.startsWith('/')) return u.replace(/\/+$/, '')
+  // Derive the scheme from the page's own protocol (https in production,
+  // http only when the page itself is served over http, e.g. local dev)
+  // instead of hardcoding 'http://' — avoids ever silently forcing an
+  // insecure scheme for a value that could resolve to a real host.
+  const scheme = typeof window !== 'undefined' ? window.location.protocol : 'https:'
+  if (u.startsWith(':')) u = `${scheme}//127.0.0.1` + u
+  if (!u.startsWith('http://') && !u.startsWith('https://')) u = `${scheme}//` + u
+  if (!/\/api\/v1\/?$/.test(u)) {
+    if (u.endsWith('/')) u += 'api/v1'
+    else if (!/\/api\/v1/.test(u)) u += '/api/v1'
+  }
+  return u.replace(/\/+$/, '')
+})()
+
+// Get base URL for static files (uploads)
+const STATIC_BASE_URL = (() => {
+  let u = API_BASE_URL
+  // Remove /api/v1 suffix
+  if (u.includes('/api/v1')) {
+    u = u.replace('/api/v1', '')
+  }
+  // If it's a relative path and ends up empty, use empty string
+  if (!u || u === '') {
+    return ''
+  }
+  return u.replace(/\/+$/, '')
+})()
+
+export { STATIC_BASE_URL, API_BASE_URL }
+
+/**
+ * Turn a FastAPI error body into a plain, renderable string.
+ *
+ * FastAPI's automatic request-validation errors return `detail` as an
+ * ARRAY of Pydantic error objects — {type, loc, msg, input, ctx} — not a
+ * string. Code that did `data?.detail || fallback` and then rendered the
+ * result directly in JSX (e.g. `{statusMsg}`) would crash React with
+ * "Objects are not valid as a React child" the first time a 422 like that
+ * actually occurred, since detail-as-string only covers HTTPException-
+ * raised errors, not Pydantic validation failures.
+ */
+function formatApiErrorDetail(detail) {
+  if (!detail) return null
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => {
+        if (typeof d === 'string') return d
+        const field = Array.isArray(d?.loc) ? d.loc.filter(p => p !== 'body').join('.') : ''
+        return field ? `${field}: ${d?.msg || 'Invalid value'}` : (d?.msg || 'Invalid value')
+      })
+      .join('; ')
+  }
+  if (typeof detail === 'object') return detail.msg || JSON.stringify(detail)
+  return String(detail)
+}
+
+/**
+ * Fetch a binary endpoint (e.g. a generated PDF) and trigger a browser
+ * download, using the same cookie/token auth as apiRequest. Regular
+ * apiRequest() can't be reused here since it always tries to parse the
+ * response as JSON/text — this keeps the raw bytes as a Blob instead.
+ */
+async function downloadFile(endpoint, fallbackFilename = 'download') {
+  const url = `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : '/' + endpoint}`
+  const token = localStorage.getItem('access_token') || localStorage.getItem('token')
+  const isValidToken = token && token !== 'undefined' && token !== 'null' && token.length > 10
+
+  const headers = { ...delegationHeaders() }
+  if (isValidToken) headers['Authorization'] = `Bearer ${token}`
+
+  const response = await fetch(url, { credentials: 'include', headers })
+
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`
+    try {
+      const data = await response.json()
+      message = formatApiErrorDetail(data?.detail) || data?.message || message
+    } catch {
+      // response wasn't JSON — keep the generic status message
+    }
+    return { ok: false, error: message }
+  }
+
+  const blob = await response.blob()
+  const disposition = response.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename="?([^"]+)"?/)
+  const filename = match ? match[1] : fallbackFilename
+
+  const blobUrl = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = blobUrl
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.URL.revokeObjectURL(blobUrl)
+
+  return { ok: true }
+}
+
+/**
+ * Fetch a binary endpoint (e.g. a generated PDF) as a Blob for in-page
+ * preview, with the same auth (and read-only view headers) as apiRequest.
+ * @returns {Promise<{ok: boolean, blob?: Blob, filename?: string, error?: string}>}
+ */
+async function fetchBlob(endpoint, fallbackFilename = 'document.pdf') {
+  const url = `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : '/' + endpoint}`
+  const token = localStorage.getItem('access_token') || localStorage.getItem('token')
+  const isValidToken = token && token !== 'undefined' && token !== 'null' && token.length > 10
+  const headers = { ...delegationHeaders() }
+  if (isValidToken) headers['Authorization'] = `Bearer ${token}`
+  try {
+    const response = await fetch(url, { credentials: 'include', headers })
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`
+      try {
+        const data = await response.json()
+        message = formatApiErrorDetail(data?.detail) || data?.message || message
+      } catch {
+        // not JSON — keep the status message
+      }
+      return { ok: false, error: message }
+    }
+    const disposition = response.headers.get('content-disposition') || ''
+    const match = disposition.match(/filename="?([^"]+)"?/)
+    return { ok: true, blob: await response.blob(), filename: match ? match[1] : fallbackFilename }
+  } catch (e) {
+    return { ok: false, error: e.message || 'Network error' }
+  }
+}
+
+/**
+ * Make an authenticated API request with cookie support
+ * @param {string} endpoint - API endpoint (without base URL)
+ * @param {object} options - Fetch options (method, body, headers, etc.)
+ * @returns {Promise<{ok: boolean, data: any, error?: string, status: number}>}
+ */
+async function apiRequest(endpoint, options = {}) {
+  const url = `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : '/' + endpoint}`
+  // Increased default timeout to 180s for AI-heavy tasks
+  const timeout = options.timeout || 180000 
+  
+  // Create AbortController if signal is not provided
+  let controller = null
+  let signal = options.signal
+  let timeoutId = null
+
+  if (!signal) {
+    controller = new AbortController()
+    signal = controller.signal
+    timeoutId = setTimeout(() => {
+      if (controller) controller.abort('timeout')
+    }, timeout)
+  }
+
+  const defaultOptions = {
+    credentials: 'include', // Send cookies with every request
+    signal: signal,
+    headers: {
+      ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...options.headers,
+    },
+    ...options,
+  }
+
+  // Manually attach access_token from localStorage if available (fallback for non-cookie scenarios)
+  const token = localStorage.getItem('access_token') || localStorage.getItem('token')
+  const isValidToken = token && token !== 'undefined' && token !== 'null' && token.length > 10
+  
+  if (isValidToken && !defaultOptions.headers['Authorization']) {
+    defaultOptions.headers['Authorization'] = `Bearer ${token}`
+  }
+
+  // Read-only view of another account in this tab (admin -> client, or head
+  // office -> branch). Auth endpoints and calls that explicitly opt out
+  // always run as the signed-in user themselves.
+  const delegation = getDelegation()
+  const sendsDelegation = !!delegation && !options.noDelegation && !endpoint.startsWith('/auth/')
+  if (sendsDelegation) {
+    defaultOptions.headers = { ...defaultOptions.headers, ...delegationHeaders() }
+  }
+
+  try {
+    const response = await fetch(url, defaultOptions)
+    if (timeoutId) clearTimeout(timeoutId)
+    const contentType = response.headers.get('content-type')
+    let data = null
+
+    // A 204 No Content (or any response with an empty body) has nothing
+    // to parse — attempting response.json() on it throws "Unexpected end
+    // of JSON input" even when the Content-Type header says JSON.
+    if (response.status === 204) {
+      data = null
+    } else if (contentType?.includes('application/json')) {
+      const text = await response.text()
+      data = text ? JSON.parse(text) : null
+    } else {
+      data = await response.text()
+    }
+
+    // Handle 401 Unauthorized - Try to refresh token
+    if (response.status === 401) {
+      // Don't retry refresh if the endpoint itself IS refresh or login
+      if (endpoint.includes('/auth/refresh') || endpoint.includes('/auth/login') || endpoint.includes('/auth/register')) {
+        return {
+          ok: false,
+          status: 401,
+          error: data?.error?.message || formatApiErrorDetail(data?.detail) || 'Session expired',
+          data: null,
+        }
+      }
+
+      // Clear local token if backend says it's invalid
+      localStorage.removeItem('access_token')
+      localStorage.removeItem('token')
+
+      const refreshed = await refreshAccessToken()
+      if (refreshed) {
+        // Retry the original request after refresh
+        return apiRequest(endpoint, options)
+      }
+      
+      // If refresh failed or not possible, redirect to login
+      if (typeof window !== 'undefined' && !window.location.pathname.includes('/auth/login')) {
+        console.warn('Unauthorized access, redirecting to login...')
+        // Use replace to avoid back button issues
+        window.location.replace('/auth/login?expired=true')
+      }
+
+      return {
+        ok: false,
+        status: 401,
+        error: data?.error?.message || formatApiErrorDetail(data?.detail) || 'Unauthorized - please login again',
+        data: null,
+      }
+    }
+
+    // View access revoked/expired: leave the read-only view immediately.
+    if (response.status === 403 && sendsDelegation && data?.detail?.code === 'DELEGATION_ENDED') {
+      const home = delegationHomePath(delegation)
+      clearDelegation()
+      if (typeof window !== 'undefined') window.location.replace(`${home}?ended=1`)
+    }
+
+    // Handle other errors
+    if (!response.ok) {
+      // Check for database connection errors
+      if (response.status === 503 && data?.error?.code === 'DATABASE_CONNECTION_ERROR') {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Database connection failed. Please ensure the database is running and configured correctly.',
+          data: null,
+        }
+      }
+      
+      return {
+        ok: false,
+        status: response.status,
+        error: data?.error?.message || data?.message || formatApiErrorDetail(data?.detail) || `HTTP ${response.status}`,
+        data: null,
+      }
+    }
+
+    // Success response
+    const isSuccess = response.ok || (typeof data === 'object' && data?.success === true)
+    const result = {
+      ok: isSuccess,
+      success: data?.success,
+      status: response.status,
+      data: data?.data || data, // Backend returns {data: ...}, fallback to response
+      error: null,
+      ...data, // Spread all top-level fields from data (like unread_count)
+    }
+    return result
+  } catch (error) {
+    if (timeoutId) clearTimeout(timeoutId)
+    console.error(`API Request Error [${endpoint}]:`, error)
+    
+    if (error.name === 'AbortError') {
+      return {
+        ok: false,
+        status: 408,
+        error: 'Request timed out. Please check your internet connection or server status.',
+        data: null,
+      }
+    }
+    
+    return {
+      ok: false,
+      status: 0,
+      error: error.message || 'Network error',
+      data: null,
+    }
+  }
+}
+
+/**
+ * Refresh access token using the refresh token cookie
+ * @returns {Promise<boolean>} - true if refresh succeeded, false otherwise
+ */
+async function refreshAccessToken() {
+  try {
+    const refreshToken = localStorage.getItem('refresh_token')
+    
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : null
+    })
+
+    const data = await response.json()
+    
+    if (response.ok && data.data) {
+      // If backend returned a new access token in the response data, store it
+      if (data.data.access_token) {
+        localStorage.setItem('access_token', data.data.access_token)
+        localStorage.setItem('token', data.data.access_token)
+      }
+      return true
+    }
+    return false
+  } catch (error) {
+    console.error('Token refresh failed:', error)
+    return false
+  }
+}
+
+/**
+ * Check if user is currently authenticated (has valid access token cookie)
+ * @returns {Promise<boolean>}
+ */
+async function isAuthenticated() {
+  const response = await apiRequest('/user/profile')
+  return response.ok
+}
+
+/**
+ * Logout - Clear cookies server-side
+ * @returns {Promise<object>}
+ */
+async function logout() {
+  return apiRequest('/auth/logout', { method: 'POST' })
+}
+
+// Generic API client with GET, POST, PUT, DELETE methods
+export const api = {
+  get: (endpoint) => apiRequest(endpoint),
+  post: (endpoint, data) => apiRequest(endpoint, { 
+    method: 'POST', 
+    body: data instanceof FormData ? data : JSON.stringify(data) 
+  }),
+  put: (endpoint, data) => apiRequest(endpoint, { 
+    method: 'PUT', 
+    body: data instanceof FormData ? data : JSON.stringify(data) 
+  }),
+  delete: (endpoint) => apiRequest(endpoint, { method: 'DELETE' }),
+}
+
+// Export API methods grouped by feature
+export const auth = {
+  register: (data) => apiRequest('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
+  login: (data) => apiRequest('/auth/login', { method: 'POST', body: JSON.stringify(data), timeout: 10000 }),
+  logout: () => logout(),
+  refreshToken: () => refreshAccessToken(),
+  sendOtp: (data) => apiRequest('/auth/otp/send', { method: 'POST', body: JSON.stringify(data) }),
+  verifyOtp: (data) => apiRequest('/auth/otp/verify', { method: 'POST', body: JSON.stringify(data) }),
+  sendPasswordResetOtp: (data) => apiRequest('/auth/password/send-otp', { method: 'POST', body: JSON.stringify(data) }),
+  verifyPasswordResetOtp: (data) => apiRequest('/auth/password/verify-otp', { method: 'POST', body: JSON.stringify(data) }),
+  resetPassword: (data) => apiRequest('/auth/password/reset', { method: 'POST', body: JSON.stringify(data) }),
+  sendEmailLoginOtp: (data) => apiRequest('/auth/login/send-email-otp', { method: 'POST', body: JSON.stringify(data) }),
+  verifyEmailLoginOtp: (data) => apiRequest('/auth/login/verify-email-otp', { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const user = {
+  getProfile: () => apiRequest('/user/profile', { timeout: 10000 }),
+  updateProfile: (data) => apiRequest('/user/profile', { method: 'PUT', body: JSON.stringify(data) }),
+  getSubscription: () => apiRequest('/user/subscription', { timeout: 10000 }),
+  sendPhoneChangeOtp: (data) => apiRequest('/user/phone-change/send-otp', { method: 'POST', body: JSON.stringify(data) }),
+  verifyPhoneChangeOtp: (data) => apiRequest('/user/phone-change/verify-otp', { method: 'POST', body: JSON.stringify(data) }),
+  sendEmailChangeOtp: (data) => apiRequest('/user/email-change/send-otp', { method: 'POST', body: JSON.stringify(data) }),
+  verifyEmailChangeOtp: (data) => apiRequest('/user/email-change/verify-otp', { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const purchaseOrders = {
+  create: (data) => {
+    const formData = new FormData()
+    
+    if (data.po_number) formData.append('po_number', data.po_number)
+    if (data.vendor) formData.append('vendor', data.vendor)
+    if (data.gstin) formData.append('gstin', data.gstin)
+    if (data.vendor_email) formData.append('vendor_email', data.vendor_email)
+    if (data.vendor_phone) formData.append('vendor_phone', data.vendor_phone)
+    if (data.amount) formData.append('amount', data.amount)
+    if (data.due_date) formData.append('due_date', data.due_date)
+    if (data.status) formData.append('status', data.status)
+    if (data.notes) formData.append('notes', data.notes)
+    if (data.evidence_url) formData.append('evidence_url', data.evidence_url)
+    if (data.supplier_address) formData.append('supplier_address', data.supplier_address)
+    if (data.delivery_address) formData.append('delivery_address', data.delivery_address)
+    if (data.invoice_address) formData.append('invoice_address', data.invoice_address)
+    if (data.payment_window_days) formData.append('payment_window_days', data.payment_window_days)
+    if (data.reason) formData.append('reason', data.reason)
+    
+    if (data.file) {
+      formData.append('file', data.file)
+    }
+    
+    return apiRequest('/purchase-orders', { 
+      method: 'POST', 
+      body: formData, 
+      headers: {} 
+    })
+  },
+  bulkImport: (formData) => apiRequest('/purchase-orders/bulk-import-upload', { 
+    method: 'POST', 
+    body: formData,
+    // Note: Don't set Content-Type header; fetch will automatically set it to multipart/form-data with boundary
+    headers: {} 
+  }),
+  bulkImportJson: (items) => apiRequest('/purchase-orders/bulk-import', { 
+    method: 'POST', 
+    body: JSON.stringify(items) 
+  }),
+  list: (page = 1, pageSize = 20, includeArchived = false, opt = {}) => apiRequest(`/purchase-orders?page=${page}&page_size=${pageSize}&include_archived=${includeArchived}`, opt),
+  search: (q = '', limit = 10) => apiRequest(`/purchase-orders/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  get: (id) => apiRequest(`/purchase-orders/${id}`),
+  // Generated purchase-order PDF as a Blob (for in-page preview / download)
+  pdfBlob: (id, poNumber) => fetchBlob(`/purchase-orders/${id}/pdf`, `PO-${poNumber || id}.pdf`),
+  update: (id, data) => apiRequest(`/purchase-orders/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id, data) => apiRequest(`/purchase-orders/${id}`, { method: 'DELETE', body: data ? JSON.stringify(data) : undefined }),
+  archive: (id, data) => apiRequest(`/purchase-orders/${id}/archive`, { method: 'POST', body: data ? JSON.stringify(data) : undefined }),
+  markPaid: (id, reason, file) => {
+    const formData = new FormData()
+    formData.append('reason', reason)
+    if (file) {
+      formData.append('file', file)
+    }
+    return apiRequest(`/purchase-orders/${id}/mark-paid`, { 
+      method: 'POST', 
+      body: formData,
+      headers: {}
+    })
+  },
+  getReceipt: (id) => apiRequest(`/purchase-orders/${id}/receipt`),
+  uploadReceipt: (id, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest(`/purchase-orders/${id}/upload-receipt`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  sendReminder: (id) => apiRequest(`/purchase-orders/${id}/send-reminder`, { method: 'POST' }),
+  sendLegalNotice: (id, data) => apiRequest(`/purchase-orders/${id}/send-legal-notice`, { method: 'POST', body: JSON.stringify(data) }),
+  sendToLegal: (id, reason, file) => {
+    const formData = new FormData()
+    formData.append('reason', reason)
+    if (file) {
+      formData.append('file', file)
+    }
+    return apiRequest(`/purchase-orders/${id}/send-to-legal-support`, { 
+      method: 'POST', 
+      body: formData,
+      headers: {}
+    })
+  },
+  approve: (id) => apiRequest(`/purchase-orders/${id}/approve`, { method: 'POST' }),
+  reject: (id, reason) => apiRequest(`/purchase-orders/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) }),
+  listPending: () => apiRequest('/purchase-orders/workflow/pending'),
+  // PDF scan-import: step 1 reads the PDF and returns extracted fields for preview (nothing saved yet)
+  scanPdf: (file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest('/purchase-orders/scan-pdf', { method: 'POST', body: formData, headers: {} })
+  },
+  // PDF scan-import: step 2 confirms the (possibly corrected) fields; creates a new PO
+  // or updates the matching existing open PO if one with that PO number already exists
+  importPdf: (data) => {
+    const formData = new FormData()
+    formData.append('po_number', data.po_number || '')
+    formData.append('vendor', data.vendor || '')
+    if (data.gstin) formData.append('gstin', data.gstin)
+    if (data.vendor_email) formData.append('vendor_email', data.vendor_email)
+    if (data.vendor_phone) formData.append('vendor_phone', data.vendor_phone)
+    formData.append('amount', data.amount ?? '')
+    formData.append('due_date', data.due_date || '')
+    formData.append('payment_window_days', data.payment_window_days ?? 50)
+    if (data.file) formData.append('file', data.file)
+    return apiRequest('/purchase-orders/import-pdf', { method: 'POST', body: formData, headers: {} })
+  },
+}
+
+export const admin = {
+  getSettings: () => apiRequest('/user/admin/settings'),
+  updateSettings: (data) => apiRequest('/user/admin/settings', { method: 'POST', body: JSON.stringify(data) }),
+  getSubscriptionAnalytics: () => apiRequest('/admin/analytics/subscriptions'),
+  getDefaulterAnalytics: () => apiRequest('/admin/analytics/defaulters'),
+  getInternalStats: () => apiRequest('/admin/analytics/internal'), // We'll add this
+  getPendingDefaulters: () => apiRequest('/admin/defaulters/pending'),
+  verifyDefaulterCase: (caseId, action, notes = '') => apiRequest(`/admin/defaulters/${caseId}/verify`, { method: 'PUT', body: JSON.stringify({ action, notes }) }),
+}
+
+// Manual reminder for PO (additive standalone function)
+export const sendPOReminder = (poId, data = null) => apiRequest(`/purchase-orders/${poId}/send-reminder`, { method: 'POST', body: data ? JSON.stringify(data) : undefined })
+
+export const getPOReminderConfig = () => apiRequest('/admin/po-reminders')
+
+export const updatePOReminderConfig = (data) => apiRequest('/admin/po-reminders', { method: 'PUT', body: JSON.stringify(data) })
+
+export const getAlertMessage = () => apiRequest('/admin/settings/alert-message')
+
+export const updateAlertMessage = (message) => apiRequest('/admin/settings/alert-message', { method: 'POST', body: JSON.stringify({ message }) })
+
+// Public, no-auth fetch used by the homepage alert popup itself.
+export const getPublicAlertMessage = () => apiRequest('/admin/settings/alert-message/public')
+
+export const getTrustTicker = () => apiRequest('/admin/settings/trust-ticker')
+
+export const updateTrustTicker = (items) => apiRequest('/admin/settings/trust-ticker', { method: 'POST', body: JSON.stringify({ items }) })
+
+export const getPublicTrustTicker = () => apiRequest('/admin/settings/trust-ticker/public')
+
+export const getBusinessStats = () => apiRequest('/admin/settings/business-stats')
+
+export const updateBusinessStats = (items) => apiRequest('/admin/settings/business-stats', { method: 'POST', body: JSON.stringify({ items }) })
+
+export const getPublicBusinessStats = () => apiRequest('/admin/settings/business-stats/public')
+
+export const sendChatMessage = (message) => apiRequest('/chat', { method: 'POST', body: JSON.stringify({ message }), timeout: 180000 })
+
+export const subscriptions = {
+  getPlans: () => apiRequest('/subscriptions/plans'),
+  purchase: (planId) => apiRequest('/payments/initiate', { method: 'POST', body: JSON.stringify({ plan_id: planId, payment_method: 'qr_code' }) }),
+  getStatus: () => apiRequest('/subscriptions/status'),
+  getDetails: (id) => apiRequest(`/subscriptions/${id}`),
+  uploadProof: (id, proofUrl) => apiRequest(`/subscriptions/${id}/upload-proof`, { method: 'POST', body: JSON.stringify({ payment_proof_url: proofUrl }) }),
+  verify: (id) => apiRequest(`/subscriptions/${id}/verify`, { method: 'POST' }),
+  process: (id) => apiRequest(`/subscriptions/${id}/process`, { method: 'POST' }),
+  approve: (id) => apiRequest(`/subscriptions/${id}/approve`, { method: 'POST' }),
+  reject: (id, reason) => apiRequest(`/subscriptions/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) }),
+  listPending: () => apiRequest('/subscriptions/workflow/pending'),
+  initiatePayment: (planId, method = 'qr_code') => apiRequest('/payments/initiate', { method: 'POST', body: JSON.stringify({ plan_id: planId, payment_method: method }) }),
+  verifyPayment: (paymentId, transactionId) => apiRequest(`/payments/${paymentId}/verify`, { method: 'POST', body: JSON.stringify({ transaction_id: transactionId }) }),
+  // Master Admin plan management — edits what getPlans()/the public
+  // Offerings page actually shows, since Offerings now fetches from the
+  // same underlying Plan records instead of a hardcoded list.
+  adminListPlans: () => apiRequest('/admin/plans'),
+  adminCreatePlan: (data) => apiRequest('/admin/plans', { method: 'POST', body: JSON.stringify(data) }),
+  adminUpdatePlan: (planId, data) => apiRequest(`/admin/plans/${planId}`, { method: 'PUT', body: JSON.stringify(data) }),
+  adminDeactivatePlan: (planId) => apiRequest(`/admin/plans/${planId}`, { method: 'DELETE' }),
+}
+
+export const defaulters = {
+  create: (data) => apiRequest('/defaulters', { method: 'POST', body: JSON.stringify(data) }),
+  list: (page = 1, pageSize = 20, opt = {}) => apiRequest(`/defaulters?page=${page}&page_size=${pageSize}`, opt),
+  get: (id) => apiRequest(`/defaulters/${id}`),
+  update: (id, data) => apiRequest(`/defaulters/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => apiRequest(`/defaulters/${id}`, { method: 'DELETE' }),
+  uploadDocument: (id, data) => apiRequest(`/defaulters/${id}/upload-document`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const invoices = {
+  create: (data) => apiRequest('/invoices', { method: 'POST', body: JSON.stringify(data) }),
+  list: (params = {}, opt = {}) => {
+    const queryParams = new URLSearchParams()
+    if (params.skip !== undefined) queryParams.append('skip', params.skip)
+    if (params.limit !== undefined) queryParams.append('limit', params.limit)
+    if (params.status) queryParams.append('status', params.status)
+    if (params.counterparty_gstin) queryParams.append('counterparty_gstin', params.counterparty_gstin)
+    if (params.counterparty_pan) queryParams.append('counterparty_pan', params.counterparty_pan)
+    if (params.search) queryParams.append('search', params.search)
+    const query = queryParams.toString()
+    return apiRequest(`/invoices${query ? '?' + query : ''}`, opt)
+  },
+  get: (id) => apiRequest(`/invoices/${id}`),
+  update: (id, data) => apiRequest(`/invoices/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => apiRequest(`/invoices/${id}`, { method: 'DELETE' }),
+  toggleAcknowledgment: (id) => apiRequest(`/invoices/${id}/acknowledge`, { method: 'POST' }),
+  addFollowUpNote: (id, note) => apiRequest(`/invoices/${id}/follow-up`, { method: 'POST', body: JSON.stringify({ note }) }),
+  getDueReminders: (opt = {}) => apiRequest('/invoices/reminders/due', opt),
+  submit: (id) => apiRequest(`/invoices/${id}/submit`, { method: 'POST' }),
+  pendingOperations: () => apiRequest('/invoices/workflow/pending-operations'),
+  operationsVerify: (id, notes) => apiRequest(`/invoices/${id}/operations-verify`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  operationsReject: (id, notes) => apiRequest(`/invoices/${id}/operations-reject`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  pendingMaster: () => apiRequest('/invoices/workflow/pending-master'),
+  masterApprove: (id, notes) => apiRequest(`/invoices/${id}/master-approve`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  masterReject: (id, notes) => apiRequest(`/invoices/${id}/master-reject`, { method: 'POST', body: JSON.stringify({ notes }) }),
+}
+
+export const accountProfile = {
+  get: () => apiRequest('/account/profile'),
+  update: (data) => apiRequest('/account/profile', { method: 'PUT', body: JSON.stringify(data) }),
+}
+
+export const vendorInvoices = {
+  create: (data) => apiRequest('/vendor-invoices', { method: 'POST', body: JSON.stringify(data) }),
+  scanPdf: (file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest('/vendor-invoices/scan-pdf', { method: 'POST', body: formData, headers: {} })
+  },
+  list: (params = {}, opt = {}) => {
+    const queryParams = new URLSearchParams()
+    if (params.skip !== undefined) queryParams.append('skip', params.skip)
+    if (params.limit !== undefined) queryParams.append('limit', params.limit)
+    if (params.status) queryParams.append('status', params.status)
+    if (params.search) queryParams.append('search', params.search)
+    if (params.include_archived) queryParams.append('include_archived', 'true')
+    const query = queryParams.toString()
+    return apiRequest(`/vendor-invoices${query ? '?' + query : ''}`, opt)
+  },
+  get: (id) => apiRequest(`/vendor-invoices/${id}`),
+  update: (id, data) => apiRequest(`/vendor-invoices/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => apiRequest(`/vendor-invoices/${id}`, { method: 'DELETE' }),
+  archive: (id) => apiRequest(`/vendor-invoices/${id}/archive`, { method: 'POST' }),
+  markPaid: (id, reason, file) => {
+    const formData = new FormData()
+    formData.append('reason', reason)
+    if (file) {
+      formData.append('file', file)
+    }
+    return apiRequest(`/vendor-invoices/${id}/mark-paid`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  uploadDocument: (id, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest(`/vendor-invoices/${id}/upload-document`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  getSettings: () => apiRequest('/vendor-invoices/settings'),
+  updateSettings: ({ vendorReminderEmail, vendorReminderDaysBefore } = {}) => {
+    const formData = new FormData()
+    if (vendorReminderEmail !== undefined) {
+      formData.append('vendor_reminder_email', vendorReminderEmail || '')
+    }
+    if (vendorReminderDaysBefore !== undefined && vendorReminderDaysBefore !== null) {
+      formData.append('vendor_reminder_days_before', vendorReminderDaysBefore)
+    }
+    return apiRequest('/vendor-invoices/settings', { method: 'PUT', body: formData, headers: {} })
+  },
+  sendReminder: (id) => apiRequest(`/vendor-invoices/${id}/send-reminder`, { method: 'POST' }),
+}
+
+export const salesInvoices = {
+  create: (data) => apiRequest('/sales-invoices', { method: 'POST', body: JSON.stringify(data) }),
+  // PDF scan-import: step 1 reads the PDF and returns extracted fields for preview (nothing saved yet)
+  scanPdf: (file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest('/sales-invoices/scan-pdf', { method: 'POST', body: formData, headers: {} })
+  },
+  // PDF scan-import: step 2 confirms the (possibly corrected) fields; creates a new invoice
+  // or updates the matching existing open invoice if one with that invoice number already exists
+  importPdf: (data) => {
+    const formData = new FormData()
+    formData.append('invoice_number', data.invoice_number || '')
+    formData.append('counterparty_name', data.counterparty_name || '')
+    if (data.counterparty_gstin) formData.append('counterparty_gstin', data.counterparty_gstin)
+    if (data.counterparty_email) formData.append('counterparty_email', data.counterparty_email)
+    if (data.counterparty_phone) formData.append('counterparty_phone', data.counterparty_phone)
+    formData.append('subtotal', data.subtotal ?? 0)
+    formData.append('tax_amount', data.tax_amount ?? 0)
+    formData.append('total', data.total ?? 0)
+    formData.append('currency', data.currency || 'INR')
+    formData.append('invoice_date', data.invoice_date || '')
+    formData.append('payment_due_date', data.payment_due_date || '')
+    return apiRequest('/sales-invoices/import-pdf', { method: 'POST', body: formData, headers: {} })
+  },
+  list: (params = {}, opt = {}) => {
+    const queryParams = new URLSearchParams()
+    if (params.skip !== undefined) queryParams.append('skip', params.skip)
+    if (params.limit !== undefined) queryParams.append('limit', params.limit)
+    if (params.status) queryParams.append('status', params.status)
+    if (params.search) queryParams.append('search', params.search)
+    if (params.include_archived) queryParams.append('include_archived', 'true')
+    const query = queryParams.toString()
+    return apiRequest(`/sales-invoices${query ? '?' + query : ''}`, opt)
+  },
+  get: (id) => apiRequest(`/sales-invoices/${id}`),
+  update: (id, data) => apiRequest(`/sales-invoices/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => apiRequest(`/sales-invoices/${id}`, { method: 'DELETE' }),
+  archive: (id) => apiRequest(`/sales-invoices/${id}/archive`, { method: 'POST' }),
+  markPaid: (id, reason, file) => {
+    const formData = new FormData()
+    formData.append('reason', reason)
+    if (file) {
+      formData.append('file', file)
+    }
+    return apiRequest(`/sales-invoices/${id}/mark-paid`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  sendReminder: (id, payload) => apiRequest(`/sales-invoices/${id}/send-reminder`, { method: 'POST', body: payload ? JSON.stringify(payload) : undefined }),
+  sendToLegal: (id, reason, file) => {
+    const formData = new FormData()
+    formData.append('reason', reason)
+    if (file) {
+      formData.append('file', file)
+    }
+    return apiRequest(`/sales-invoices/${id}/send-to-legal-support`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  uploadDocument: (id, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest(`/sales-invoices/${id}/upload-document`, {
+      method: 'POST',
+      body: formData,
+      headers: {}
+    })
+  },
+  nextNumber: () => apiRequest('/sales-invoices/next-number'),
+  pendingSummary: (opt = {}) => apiRequest('/sales-invoices/pending-summary', opt),
+  downloadPdf: (id, filename) => downloadFile(`/sales-invoices/${id}/pdf`, filename || `${id}.pdf`),
+  uploadEvidence: (id, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest(`/sales-invoices/${id}/upload-evidence`, { method: 'POST', body: formData, headers: {} })
+  },
+  requestApproval: (id, editData, evidenceUrl, evidenceFilename, reason) => apiRequest(`/sales-invoices/${id}/request-approval`, {
+    method: 'POST',
+    body: JSON.stringify({ edit_data: editData, evidence_url: evidenceUrl, evidence_filename: evidenceFilename, reason }),
+  }),
+  pendingOperations: () => apiRequest('/sales-invoices/workflow/pending-operations'),
+  operationsVerify: (id, notes) => apiRequest(`/sales-invoices/${id}/operations-verify`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  operationsReject: (id, notes) => apiRequest(`/sales-invoices/${id}/operations-reject`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  pendingMaster: () => apiRequest('/sales-invoices/workflow/pending-master'),
+  masterApprove: (id, notes) => apiRequest(`/sales-invoices/${id}/master-approve`, { method: 'POST', body: JSON.stringify({ notes }) }),
+  masterReject: (id, notes) => apiRequest(`/sales-invoices/${id}/master-reject`, { method: 'POST', body: JSON.stringify({ notes }) }),
+}
+
+export const businessRequests = {
+  create: (data) => apiRequest('/business-requests', { method: 'POST', body: JSON.stringify(data) }),
+  getMy: (opt = {}) => apiRequest('/business-requests/my', opt),
+  getPending: (opt = {}) => apiRequest('/business-requests/pending', opt),
+  complete: (id, data) => apiRequest(`/business-requests/${id}/complete`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const businessCheck = {
+  create: (data) => apiRequest('/business-check/request', { method: 'POST', body: JSON.stringify(data) }),
+  getMy: (opt = {}) => apiRequest('/business-check/my', opt),
+  getPending: (opt = {}) => apiRequest('/business-check/pending', opt),
+  operationsReview: (id, data) => apiRequest(`/business-check/${id}/operations-review`, { method: 'POST', body: JSON.stringify(data) }),
+  getPendingMaster: (opt = {}) => apiRequest('/business-check/pending-master', opt),
+  masterApprove: (id, data) => apiRequest(`/business-check/${id}/master-approve`, { method: 'POST', body: JSON.stringify(data) }),
+  saveToNetwork: (id) => apiRequest(`/business-check/${id}/save-to-network`, { method: 'POST' }),
+  reject: (id) => apiRequest(`/business-check/${id}/reject`, { method: 'POST' }),
+}
+
+export const supportRequests = {
+  create: (data) => apiRequest('/support-requests', { method: 'POST', body: JSON.stringify(data) }),
+  list: (opt = {}) => apiRequest('/support-requests', opt),
+  getMy: (opt = {}) => apiRequest('/support-requests/my', opt),
+  resolve: (id, data) => apiRequest(`/support-requests/${id}/resolve`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const creditReports = {
+  create: (data) => apiRequest('/credit-reports', { method: 'POST', body: JSON.stringify(data) }),
+  list: (page = 1, pageSize = 20, opt = {}) => apiRequest(`/credit-reports?page=${page}&page_size=${pageSize}`, opt),
+  get: (id) => apiRequest(`/credit-reports/${id}`),
+  update: (id, data) => apiRequest(`/credit-reports/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+}
+
+export const settlements = {
+  create: (data) => apiRequest('/settlements', { method: 'POST', body: JSON.stringify(data) }),
+  list: (page = 1, pageSize = 20, opt = {}) => apiRequest(`/settlements?page=${page}&page_size=${pageSize}`, opt),
+  get: (id) => apiRequest(`/settlements/${id}`),
+  update: (id, data) => apiRequest(`/settlements/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+}
+
+export const appointments = {
+  create: (data) => apiRequest('/appointments', { method: 'POST', body: JSON.stringify(data) }),
+  list: (status = null, opt = {}) => {
+    const query = status ? `?status=${status}` : ''
+    return apiRequest(`/appointments${query}`, opt)
+  },
+  get: (id) => apiRequest(`/appointments/${id}`),
+  update: (id, data) => apiRequest(`/appointments/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => apiRequest(`/appointments/${id}`, { method: 'DELETE' }),
+}
+
+export const contact = {
+  submit: (data) => apiRequest('/contact/public', { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const wallet = {
+  getBalance: (opt = {}) => apiRequest('/wallet/balance', opt),
+  getHistory: (page = 1, limit = 10) => apiRequest(`/wallet/history?page=${page}&limit=${limit}`),
+  redeem: (amount, reference) => apiRequest('/wallet/redeem', { method: 'POST', body: JSON.stringify({ amount, reference }) }),
+}
+
+export const adminApi = {
+  getInternalStats: () => apiRequest('/admin/analytics/internal'),
+  listInvitations: ({ skip = 0, limit = 50 } = {}) => apiRequest(`/admin/invitations?skip=${skip}&limit=${limit}`),
+  createInvitation: (data) => apiRequest('/admin/invitations', { method: 'POST', body: JSON.stringify(data) }),
+  updateInvitation: (id, data) => apiRequest(`/admin/invitations/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteInvitation: (id) => apiRequest(`/admin/invitations/${id}`, { method: 'DELETE' }),
+  createInternalUser: (data) => apiRequest('/admin/create-user', { method: 'POST', body: JSON.stringify(data) }),
+  listUsers: () => apiRequest('/admin/users'),
+  updateUserRole: (id, role) => apiRequest(`/admin/users/${id}/role`, { method: 'PUT', body: JSON.stringify({ role }) }),
+  deleteUser: (id) => apiRequest(`/admin/users/${id}`, { method: 'DELETE' }),
+  getRoleSettings: () => apiRequest('/admin/role-settings'),
+  listCompanies: () => apiRequest('/admin/companies'),
+  getCompanyDetails: (companyId) => apiRequest(`/admin/companies/${companyId}`),
+  renameCompany: (companyId, companyName) => apiRequest(`/admin/companies/${companyId}`, { method: 'PUT', body: JSON.stringify({ company_name: companyName }) }),
+  deleteCompany: (companyId, confirm = false) => apiRequest(`/admin/companies/${companyId}?confirm=${confirm}`, { method: 'DELETE' }),
+  post: (endpoint, data) => apiRequest(endpoint, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const adminConfig = {
+  getPOReminders: () => apiRequest('/admin/po-reminders'),
+  updatePOReminders: (data) => apiRequest('/admin/po-reminders', { method: 'PUT', body: JSON.stringify(data) }),
+}
+
+export const invitations = {
+  verify: (token) => apiRequest(`/invitations/verify?token=${encodeURIComponent(token)}`),
+  accept: (data) => apiRequest('/invitations/accept', { method: 'POST', body: JSON.stringify(data) }),
+  acceptStrict: (data) => apiRequest('/invitations/accept-invitation', { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const credibility = {
+  list: () => apiRequest('/credibility'),
+  get: (id) => apiRequest(`/credibility/${id}`),
+  getAiAnalysis: (id) => apiRequest(`/credibility/${id}/ai-analysis`, { method: 'POST', timeout: 180000 }),
+  recalculate: () => apiRequest('/credibility/recalculate', { method: 'POST' }),
+}
+
+// Invoice-based equivalent of `credibility` above (Inv Credibility Index) —
+// same shape, computed from Sales Invoices instead of Purchase Orders.
+export const invCredibility = {
+  list: () => apiRequest('/inv-credibility'),
+  get: (id) => apiRequest(`/inv-credibility/${id}`),
+  getAiAnalysis: (id) => apiRequest(`/inv-credibility/${id}/ai-analysis`, { method: 'POST', timeout: 180000 }),
+}
+
+export const drive = {
+  getAuthUrl: () => apiRequest('/drive/auth-url'),
+  callback: (code, state) => apiRequest('/drive/callback', { method: 'POST', body: JSON.stringify({ code, state }) }),
+  listFiles: () => apiRequest('/drive/files'),
+  upload: (formData) => apiRequest('/drive/upload', {
+    method: 'POST',
+    body: formData,
+    // Do NOT set Content-Type header for FormData; fetch sets it with boundary automatically
+    headers: {}
+  }),
+}
+
+export const ratings = {
+  check: (gstin) => {
+    if (!gstin) return Promise.resolve({ ok: false, error: 'GSTIN is required' })
+    return apiRequest('/ratings/check', { method: 'POST', body: JSON.stringify({ counterparty_gstin: String(gstin).trim().toUpperCase() }) })
+  },
+  submit: (data) => apiRequest('/ratings', { method: 'POST', body: JSON.stringify(data) }),
+  listForCompany: (companyId) => apiRequest(`/ratings/company/${companyId}`),
+  getGlobalCbi: () => apiRequest('/ratings/global-cbi'),
+  getAiAnalysis: (companyId) => apiRequest(`/ratings/ai-analyze/${companyId}`, { timeout: 180000 }),
+  getAiTrends: () => apiRequest('/ratings/ai-trends', { timeout: 180000 }),
+}
+
+export const legal = {
+  submitBusinessRequest: (data) => apiRequest('/legal/business-request', { method: 'POST', body: JSON.stringify(data) }),
+  listBusinessRequests: () => apiRequest('/legal/business-requests/pending'),
+  analyzeBusinessRequest: (id, data) => apiRequest(`/legal/business-request/${id}/analyze`, { method: 'POST', body: JSON.stringify(data) }),
+  requestGstinReport: (data) => apiRequest('/legal/gstin-check/request-report', { method: 'POST', body: JSON.stringify(data) }),
+  listGstinReports: () => apiRequest('/legal/reports/pending'),
+  completeGstinReport: (id, data) => apiRequest(`/legal/report/${id}/complete`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export const audit = {
+  getLogs: (params = {}) => {
+    const queryParams = new URLSearchParams()
+    if (params.search) queryParams.append('search', params.search)
+    if (params.action && params.action !== 'all') queryParams.append('action', params.action)
+    if (params.date_from) queryParams.append('date_from', params.date_from)
+    const query = queryParams.toString()
+    return apiRequest(`/audit-logs${query ? '?' + query : ''}`)
+  },
+}
+
+// Global Credibility Index
+export const credibilityIndex = {
+  initiateReview: (data) => apiRequest('/credibility-index/initiate', { method: 'POST', body: JSON.stringify(data) }),
+  getPendingFinancial: () => apiRequest('/credibility-index/pending/financial'),
+  submitFinancialReview: (id, data) => apiRequest(`/credibility-index/review/financial/${id}`, { method: 'POST', body: JSON.stringify(data) }),
+  getPendingLegal: () => apiRequest('/credibility-index/pending/legal'),
+  submitLegalReview: (id, data) => apiRequest(`/credibility-index/review/legal/${id}`, { method: 'POST', body: JSON.stringify(data) }),
+  getPendingOperations: () => apiRequest('/credibility-index/pending/operations'),
+  submitOperationsReview: (id, data) => apiRequest(`/credibility-index/review/operations/${id}`, { method: 'POST', body: JSON.stringify(data) }),
+  getPendingMasterAdmin: () => apiRequest('/credibility-index/pending/master-admin'),
+  submitMasterAdminDecision: (id, data) => apiRequest(`/credibility-index/approve/master-admin/${id}`, { method: 'POST', body: JSON.stringify(data) }),
+  getIndex: () => apiRequest('/credibility-index/index'),
+  getReviewStatus: (businessRequestId) => apiRequest(`/credibility-index/status/${businessRequestId}`),
+  requestCompanyRating: (companyName) => apiRequest('/credibility-index/rating-request', { method: 'POST', body: JSON.stringify({ company_name: companyName }) }),
+  getPendingRatingRequestsForOperations: () => apiRequest('/credibility-index/rating-requests/pending-operations'),
+  operationsProposeRating: (requestId, data) => apiRequest(`/credibility-index/rating-requests/${requestId}/operations-propose`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+// Client side of admin view access: generate codes, see/revoke grants
+export const accessGrants = {
+  generate: (durationHours) => apiRequest('/access-grants/codes', { method: 'POST', body: JSON.stringify({ duration_hours: durationHours }) }),
+  list: () => apiRequest('/access-grants'),
+  cancelCode: (codeId) => apiRequest(`/access-grants/codes/${codeId}/cancel`, { method: 'POST' }),
+  revoke: (grantId) => apiRequest(`/access-grants/${grantId}/revoke`, { method: 'POST' }),
+  activity: () => apiRequest('/access-grants/activity'),
+}
+
+// Admin side of admin view access (always runs as the admin, never delegated)
+export const clientAccess = {
+  redeem: (code) => apiRequest('/admin/client-access/redeem', { method: 'POST', body: JSON.stringify({ code }), noDelegation: true }),
+  mine: () => apiRequest('/admin/client-access/mine', { noDelegation: true }),
+  session: (grantId) => apiRequest(`/admin/client-access/grants/${grantId}`, { noDelegation: true }),
+  revoke: (grantId) => apiRequest(`/admin/client-access/grants/${grantId}/revoke`, { method: 'POST', noDelegation: true }),
+  all: () => apiRequest('/admin/client-access/all', { noDelegation: true }),
+  audit: (params = {}) => {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v)).toString()
+    return apiRequest(`/admin/client-access/audit${q ? '?' + q : ''}`, { noDelegation: true })
+  },
+  // A client's invoices, read under one specific grant (read-only, audited)
+  clientInvoices: (grantId) => apiRequest('/sales-invoices?limit=50&include_archived=true', {
+    noDelegation: true,
+    headers: { [DELEGATION_HEADER]: grantId },
+  }),
+}
+
+// Head office / branch organisations (always runs as the signed-in company)
+export const organization = {
+  status: () => apiRequest('/organization', { noDelegation: true }),
+  becomeHeadOffice: () => apiRequest('/organization/head-office', { method: 'POST', noDelegation: true }),
+  requestBranch: (hqGstin, branchName) => apiRequest('/organization/branch-request', {
+    method: 'POST', body: JSON.stringify({ hq_gstin: hqGstin, branch_name: branchName }), noDelegation: true,
+  }),
+  cancelRequest: () => apiRequest('/organization/branch-request/cancel', { method: 'POST', noDelegation: true }),
+  approve: (linkId) => apiRequest(`/organization/branches/${linkId}/approve`, { method: 'POST', noDelegation: true }),
+  reject: (linkId) => apiRequest(`/organization/branches/${linkId}/reject`, { method: 'POST', noDelegation: true }),
+  remove: (linkId) => apiRequest(`/organization/branches/${linkId}/remove`, { method: 'POST', noDelegation: true }),
+  summary: () => apiRequest('/organization/summary', { noDelegation: true }),
+  branchSession: (branchCompanyId) => apiRequest(`/organization/branches/${branchCompanyId}/session`, { noDelegation: true }),
+  // Super Admin
+  listOrganisations: (q = '') => apiRequest('/admin/organizations' + (q ? '?q=' + encodeURIComponent(q) : ''), { noDelegation: true }),
+  setBranchLimit: (companyId, limit) => apiRequest(`/admin/organizations/${companyId}/branch-limit`, {
+    method: 'PUT', body: JSON.stringify({ branch_limit: limit }), noDelegation: true,
+  }),
+}
+
+// Utility: Check authentication status
+export const authUtils = {
+  isAuthenticated,
+  refreshToken: refreshAccessToken,
+}
+
+export default apiRequest
